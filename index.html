@@ -1,6 +1,16 @@
-<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>GROUP STUDY ARENA</title>
-<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#06141B">
+<link rel="icon" type="image/png" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="mobile-web-app-capable" content="yes">
+<script>if('serviceWorker' in navigator){window.addEventListener('load',function(){navigator.serviceWorker.register('./sw.js').catch(function(){})})}</script>
+<meta name="description" content="Study with friends: live timers, pomodoro, group chat, subject charts and a full archive.">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;700&family=Sora:wght@500;600;700&display=swap">
 <style>
 /* Layout: focus timer left and squad grid right on desktop, bottom tab bar on phones. Palette comes from the supplied slate swatches. */
@@ -183,10 +193,16 @@ main{min-width:0}
 }
 </style>
 
+</head>
+<body>
 <div id="app"></div>
 <div id="modalRoot"></div>
 <div id="toast" role="status" aria-live="polite"></div>
 
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="firebase-config.js"></script>
 <script>
 (function(){
 'use strict';
@@ -252,12 +268,12 @@ function pname(uid){var p=prof(uid);return(p&&p.name)||'Someone';}
 /* ---------- writes ---------- */
 function enqueue(fn){S.q=S.q.then(fn).catch(writeFail);return S.q;}
 function writeFail(e){
-  if(e&&e.code==='invalid_argument'){S.readOnly=true;paintBanner();toast('This account can view but not save');}
-  else if(e&&e.code==='quota_exceeded'){toast('The shared storage is full');}
+  if(e&&(e.code==='invalid_argument'||e.code==='permission-denied')){S.readOnly=true;paintBanner();toast('Saving was blocked');}
+  else if(e&&(e.code==='quota_exceeded'||e.code==='resource-exhausted')){toast('The daily free limit of this site was reached. Try again tomorrow.');}
   else{toast('Could not save. Check your connection.');}
 }
 function saveProfile(){return enqueue(function(){return S.db.doc('profiles/'+S.uid).set(clone(S.mine));});}
-function saveLive(){return enqueue(function(){return S.db.doc('live/'+S.uid).set(clone(S.mylive));});}
+function saveLive(){return enqueue(function(){S.mylive.groups=((S.mine&&S.mine.groups)||[]).slice();return S.db.doc('live/'+S.uid).set(clone(S.mylive));});}
 function saveDay(key){var d=clone(S.logs[key]);return enqueue(function(){return S.db.doc('logs/'+S.uid+'/days/'+key).set(d);});}
 
 /* ---------- live timer logic ---------- */
@@ -280,7 +296,7 @@ function liveOf(uid){
   if(L.status==='off'||!L.startedAt)return o;
   var me=uid===S.uid;
   var stale=!me&&now-(L.lastBeat||0)>STALE_MS;
-  var ref=me?now:Math.min(now,(L.lastBeat||0)+120000);
+  var ref=me?now:Math.min(now,(L.lastBeat||0)+150000);
   o.subject=L.subject||'';o.mode=L.mode;
   if(L.status==='focus'){
     var from=Math.max(L.startedAt,sod(now));
@@ -343,7 +359,7 @@ function recoverLive(){
   var L=S.mylive;if(!L||L.status==='off'||!L.startedAt)return;
   var now=Date.now();
   if(now-(L.lastBeat||0)<=STALE_MS)return;
-  var cap=Math.max(L.startedAt,(L.lastBeat||L.startedAt)+90000);
+  var cap=Math.max(L.startedAt,(L.lastBeat||L.startedAt)+150000);
   if(L.status==='focus'){
     var full=L.mode==='pomodoro'&&cap>=L.startedAt+L.phaseLen*1000;
     var end=L.mode==='pomodoro'?Math.min(cap,L.startedAt+L.phaseLen*1000):cap;
@@ -392,7 +408,7 @@ async function createGroup(name){
     S.groups[gid]={name:name.slice(0,40),createdBy:S.uid};
     S.mine.groups=(S.mine.groups||[]).concat([gid]);
     S.activeGroup=gid;lsSet('gsa_group',gid);
-    saveProfile();closeModal();refreshAll();
+    saveProfile();afterGroups();closeModal();refreshAll();
     S.modal={type:'invite',gid:gid};renderModal();
   }catch(e){writeFail(e);}
 }
@@ -400,12 +416,12 @@ function joinGroup(gid){
   if(!S.groups[gid])return;
   if((S.mine.groups||[]).indexOf(gid)<0)S.mine.groups=(S.mine.groups||[]).concat([gid]);
   S.activeGroup=gid;lsSet('gsa_group',gid);
-  saveProfile();closeModal();clearHash();go('home');toast('Joined '+S.groups[gid].name);
+  saveProfile();afterGroups();closeModal();clearHash();go('home');toast('Joined '+S.groups[gid].name);
 }
 function leaveGroup(gid){
   S.mine.groups=(S.mine.groups||[]).filter(function(x){return x!==gid;});
   if(S.activeGroup===gid)S.activeGroup=null;
-  saveProfile();ensureActiveGroup();closeModal();refreshAll();toast('You left the group');
+  saveProfile();afterGroups();ensureActiveGroup();closeModal();refreshAll();toast('You left the group');
 }
 function clearHash(){try{if(location.hash)location.hash='';}catch(e){}}
 function setHash(h){try{location.hash=h;}catch(e){}}
@@ -526,7 +542,7 @@ function paintNav(){
   $$('.nav button').forEach(function(b){b.classList.toggle('on',b.getAttribute('data-go')===v);});
 }
 function bannerHTML(){
-  return S.readOnly?'<div class="banner" id="roBanner">This account can view the arena but cannot save. Ask the site owner to give you Editor access from the Share menu.</div>':'';
+  return S.readOnly?'<div class="banner" id="roBanner">Saving was blocked. If you own this site, check that the Firestore rules from the README are published.</div>':'';
 }
 function paintBanner(){var b=$('#roBanner');if(S.readOnly&&!b&&$('#main'))$('#main').insertAdjacentHTML('afterbegin',bannerHTML());}
 function go(view,params){
@@ -665,7 +681,7 @@ function mountMe(m){
   var p=S.mine,ob=S.ob=S.ob||{};
   ob.exam=p.exam;ob.subjects=(p.subjects||[]).slice();ob.emoji=p.emoji||'';ob.img=validImg(p.img)?p.img:null;
   var ex=EXAMS[p.exam]||EXAMS.jee;
-  m.innerHTML=bannerHTML()+'<div class="top"><div><div class="lbl">Your profile</div><h1>'+esc(p.name)+'</h1><div class="sub">Everyone who can open this site can see your profile and study stats.</div></div></div>'+
+  m.innerHTML=bannerHTML()+'<div class="top"><div><div class="lbl">Your profile</div><h1>'+esc(p.name)+'</h1><div class="sub">Everyone signed in to this site can see your profile and study stats.</div></div></div>'+
   '<section class="card"><div class="pf-head" style="margin-bottom:18px"><span id="meAv">'+avatar({img:ob.img,emoji:ob.emoji,name:p.name},84)+'</span><div class="row"><label class="btn ghost sm" for="imgIn" style="cursor:pointer">Upload photo</label><input id="imgIn" type="file" accept="image/*" class="hidden"><button class="btn ghost sm" data-act="rmimg">Remove photo</button></div></div>'+
   '<div class="field"><label>Or pick an avatar</label><div class="egrid" id="egrid">'+AVATARS.map(function(e){return'<button type="button" data-act="pickav" data-e="'+e+'" class="'+(ob.emoji===e&&!ob.img?'on':'')+'">'+e+'</button>';}).join('')+'</div></div>'+
   '<div class="field"><label for="fName">Name</label><input id="fName" maxlength="24" value="'+esc(p.name)+'"></div>'+
@@ -673,7 +689,7 @@ function mountMe(m){
   '<div class="field"><label for="fBio">About you</label><textarea id="fBio" rows="2" maxlength="140" placeholder="Target rank, favourite chapter, anything">'+esc(p.bio||'')+'</textarea></div>'+
   '<div class="field"><label>Exam</label><div class="excards" id="exCards">'+examCards(ob.exam)+'</div><label>Subjects you track</label><div class="chips" id="subChips">'+subChips(ob.exam,ob.subjects)+'</div></div>'+
   '<div class="field"><label for="fGoal">Daily goal (hours)</label><input id="fGoal" type="number" min="1" max="16" step="0.5" value="'+(p.goal||6)+'" style="width:110px"></div>'+
-  '<div class="row"><button class="btn" data-act="saveprofile">Save profile</button></div></section>';
+  '<div class="row"><button class="btn" data-act="saveprofile">Save profile</button><button class="btn ghost" data-act="signout">Sign out</button></div></section>';
 }
 function examCards(cur){
   return Object.keys(EXAMS).map(function(k){return'<button type="button" class="ex'+(cur===k?' on':'')+'" data-act="exam" data-x="'+k+'"><b>'+EXAMS[k].label+'</b><span>'+EXAMS[k].sub.join(', ')+'</span></button>';}).join('');
@@ -751,7 +767,8 @@ function renderModal(){
     else{var n=membersOf(m.gid).length;h='<h3>Join '+esc(g.name)+'?</h3><p class="muted">'+n+' member'+(n===1?'':'s')+' so far. You will see each other\'s timers and can chat.</p><div class="row"><button class="btn grow" data-act="joinconfirm" data-g="'+m.gid+'">Join group</button></div>';}
   }else if(m.type==='invite'){
     var g2=S.groups[m.gid]||{name:'Group'};
-    h='<h3>Invite to '+esc(g2.name)+'</h3><p class="muted" style="margin:0">Friends open this site, choose Join with a code, and type:</p><div class="code" id="codeBox">'+m.gid.toUpperCase()+'</div><div class="row"><button class="btn grow" data-act="copycode" data-g="'+m.gid+'">Copy code</button></div><p class="muted" style="font-size:13px;margin:14px 0 0">While this window is open, the page address ends in #join-'+m.gid+'. Copy the link with the Share button above the page and it will open the join prompt for anyone you share the site with.</p>';
+    var link=location.href.split('#')[0]+'#join-'+m.gid;
+    h='<h3>Invite to '+esc(g2.name)+'</h3><p class="muted" style="margin:0">Send friends the link, or have them choose Join with a code and type:</p><div class="code" id="codeBox">'+m.gid.toUpperCase()+'</div><div class="row"><button class="btn grow" data-act="copylink" data-l="'+esc(link)+'">Copy invite link</button><button class="btn ghost grow" data-act="copycode" data-g="'+m.gid+'">Copy code</button></div>';
   }else if(m.type==='leave'){
     var g3=S.groups[m.gid]||{name:'this group'};
     h='<h3>Leave '+esc(g3.name)+'?</h3><p class="muted">Your study history stays on your profile. You can rejoin with the code.</p><div class="row"><button class="btn grow" data-act="leaveconfirm" data-g="'+m.gid+'">Leave</button><button class="btn ghost grow" data-act="closemodal">Cancel</button></div>';
@@ -776,11 +793,11 @@ function loading(){gate('<h1>GROUP STUDY ARENA</h1><p class="muted">Connecting t
 function onboarding(step){
   var ob=S.ob=S.ob||{exam:'jee',subjects:EXAMS.jee.sub.slice(),name:'',age:'',emoji:AVATARS[0],img:null,goal:6,bio:''};
   step=step||1;
-  var h='<h1>GROUP STUDY ARENA</h1><p class="muted" style="margin-top:0">Signed in with your claude.ai account. Set up your study profile once and you are in.</p><div class="steps"><i class="on"></i><i class="'+(step>1?'on':'')+'"></i></div>';
+  var h='<h1>GROUP STUDY ARENA</h1><p class="muted" style="margin-top:0">Signed in as '+esc((AUTH&&AUTH.currentUser&&AUTH.currentUser.email)||'your account')+'. Set up your study profile once and you are in.</p><div class="steps"><i class="on"></i><i class="'+(step>1?'on':'')+'"></i></div>';
   if(step===1){
     h+='<div class="card"><h3>What are you preparing for?</h3><div class="excards" id="exCards">'+examCards(ob.exam)+'</div><div class="lbl" style="margin-bottom:8px">Subjects you will track</div><div class="chips" id="subChips">'+subChips(ob.exam,ob.subjects)+'</div><div class="row" style="margin-top:18px"><button class="btn grow" data-act="obnext">Continue</button></div></div>';
   }else{
-    h+='<div class="card"><h3>Your profile</h3><div class="pf-head" style="margin:14px 0"><span id="meAv">'+avatar({img:ob.img,emoji:ob.emoji,name:ob.name},84)+'</span><div class="row"><label class="btn ghost sm" for="imgIn" style="cursor:pointer">Upload photo</label><input id="imgIn" type="file" accept="image/*" class="hidden"></div></div><div class="egrid" id="egrid" style="margin-bottom:14px">'+AVATARS.map(function(e){return'<button type="button" data-act="pickav" data-e="'+e+'" class="'+(ob.emoji===e&&!ob.img?'on':'')+'">'+e+'</button>';}).join('')+'</div><div class="field"><label for="fName">Name</label><input id="fName" maxlength="24" value="'+esc(ob.name)+'" placeholder="What should friends call you?"></div><div class="row"><div class="field" style="margin:0 0 14px"><label for="fAge">Age</label><input id="fAge" type="number" min="5" max="99" value="'+esc(ob.age)+'" style="width:100px"></div><div class="field" style="margin:0 0 14px"><label for="fGoal">Daily goal (hours)</label><input id="fGoal" type="number" min="1" max="16" step="0.5" value="'+ob.goal+'" style="width:130px"></div></div><p class="muted" style="font-size:13px">Your name, age, photo and study stats are visible to everyone who can open this site.</p><div class="row"><button class="btn ghost" data-act="obback">Back</button><button class="btn grow" data-act="obsave">Enter the arena</button></div></div>';
+    h+='<div class="card"><h3>Your profile</h3><div class="pf-head" style="margin:14px 0"><span id="meAv">'+avatar({img:ob.img,emoji:ob.emoji,name:ob.name},84)+'</span><div class="row"><label class="btn ghost sm" for="imgIn" style="cursor:pointer">Upload photo</label><input id="imgIn" type="file" accept="image/*" class="hidden"></div></div><div class="egrid" id="egrid" style="margin-bottom:14px">'+AVATARS.map(function(e){return'<button type="button" data-act="pickav" data-e="'+e+'" class="'+(ob.emoji===e&&!ob.img?'on':'')+'">'+e+'</button>';}).join('')+'</div><div class="field"><label for="fName">Name</label><input id="fName" maxlength="24" value="'+esc(ob.name)+'" placeholder="What should friends call you?"></div><div class="row"><div class="field" style="margin:0 0 14px"><label for="fAge">Age</label><input id="fAge" type="number" min="5" max="99" value="'+esc(ob.age)+'" style="width:100px"></div><div class="field" style="margin:0 0 14px"><label for="fGoal">Daily goal (hours)</label><input id="fGoal" type="number" min="1" max="16" step="0.5" value="'+ob.goal+'" style="width:130px"></div></div><p class="muted" style="font-size:13px">Your name, age, photo and study stats are visible to everyone signed in to this site.</p><div class="row"><button class="btn ghost" data-act="obback">Back</button><button class="btn grow" data-act="obsave">Enter the arena</button></div></div>';
   }
   gate(h);
 }
@@ -854,6 +871,12 @@ function act(a,t){
   else if(a==='obback'){grabOb();onboarding(1);}
   else if(a==='obsave'){grabOb();finishOnboarding();}
   else if(a==='saveprofile'){grabOb();saveOwnProfile();}
+  else if(a==='signout'){AUTH.signOut().then(function(){location.reload();});}
+  else if(a==='authtab'){S.authMode=t.getAttribute('data-m');var e1=$('#aEmail')?$('#aEmail').value:'';loginScreen();$('#aEmail').value=e1;}
+  else if(a==='authgo'){doAuth();}
+  else if(a==='google'){doGoogle();}
+  else if(a==='forgot'){doForgot();}
+  else if(a==='copylink'){copyText(t.getAttribute('data-l'));}
 }
 function grabOb(){
   var n=$('#fName'),a=$('#fAge'),g=$('#fGoal'),b=$('#fBio');
@@ -875,6 +898,7 @@ document.addEventListener('change',function(e){
 });
 document.addEventListener('keydown',function(e){
   if(e.key==='Enter'&&e.target.id==='chatIn'){e.preventDefault();sendMsg();}
+  else if(e.key==='Enter'&&(e.target.id==='aPass'||e.target.id==='aEmail')){doAuth();}
   else if(e.key==='Enter'&&(e.target.id==='gName')){act('creategroup',e.target);}
   else if(e.key==='Enter'&&(e.target.id==='gCode')){act('lookup',e.target);}
   else if(e.key==='Escape'){if(S.modal)closeModal();else if(S.emoOpen){S.emoOpen=false;renderEmo();}}
@@ -897,7 +921,7 @@ async function finishOnboarding(){
     await S.db.doc('profiles/'+S.uid).set(p);
     S.mine=p;S.ob=null;await enterApp();
   }catch(e){
-    if(e&&e.code==='invalid_argument')gate('<h1>GROUP STUDY ARENA</h1><div class="card"><h3>View-only access</h3><p class="muted">Your account can open this site but cannot save to it. Ask the site owner to give you Editor access from the Share menu, then reload.</p></div>');
+    if(e&&(e.code==='invalid_argument'||e.code==='permission-denied'))gate('<h1>GROUP STUDY ARENA</h1><div class="card"><h3>Saving is blocked</h3><p class="muted">The database refused your profile. If you own this site, publish the Firestore rules from the README and reload.</p></div>');
     else toast('Could not save your profile. Try again.');
   }
 }
@@ -937,15 +961,7 @@ async function enterApp(){
   var subs=S.mine.subjects||[];S.sel.subject=subs[0]||'';
   recoverLive();
   syncToday();
-  db.collection('profiles').onSnapshot(function(snap){
-    var o={};snap.docs.forEach(function(d){o[d.id]=d.data();});S.profiles=o;onRemote('profiles');
-  },errNote);
-  db.collection('live').onSnapshot(function(snap){
-    var o={};snap.docs.forEach(function(d){if(d.id!==S.uid)o[d.id]=d.data();});S.live=o;onRemote('live');
-  },errNote);
-  db.collection('groups').onSnapshot(function(snap){
-    var o={};snap.docs.forEach(function(d){o[d.id]=d.data();});S.groups=o;onRemote('groups');
-  },errNote);
+  watchGroups();
   ensureActiveGroup();
   S.ready=true;
   shell();go('home');
@@ -962,28 +978,94 @@ async function enterApp(){
       else if(S.view==='friend'&&S.t%10===0)paintFriendSub();
       if((S.view==='stats'||S.view==='friend')&&S.t%15===0&&S.mylive&&S.mylive.status==='focus')renderStatsBody();
     },1000);
-    setInterval(heartbeat,60000);
+    setInterval(heartbeat,120000);
     document.addEventListener('visibilitychange',function(){if(!document.hidden&&S.ready){advance();heartbeat();}});
   }
 }
-async function boot(){
+/* ---------- firebase ---------- */
+var AUTH=null;
+function cfgOk(){var c=window.FIREBASE_CONFIG;return !!(c&&c.apiKey&&String(c.apiKey).indexOf('PASTE')<0&&c.projectId);}
+function wrapSnap(x){return{id:x.id,exists:x.exists,data:function(){return x.data();},metadata:x.metadata};}
+function wrapQ(x){return{docs:x.docs.map(wrapSnap),size:x.size,empty:x.empty,metadata:x.metadata};}
+function makeDoc(fs,path){var r=fs.doc(path);return{id:r.id,path:path,get:function(){return r.get().then(wrapSnap);},set:function(d){return r.set(d);},update:function(d){return r.update(d);},delete:function(){return r.delete();},onSnapshot:function(n,e){return r.onSnapshot(function(x){n(wrapSnap(x));},e);}};}
+function makeQuery(fs,q,path){return{where:function(f,o,v){return makeQuery(fs,q.where(f,o,v),path);},orderBy:function(f,d){return makeQuery(fs,q.orderBy(f,d||'asc'),path);},limit:function(n){return makeQuery(fs,q.limit(n),path);},get:function(){return q.get().then(wrapQ);},onSnapshot:function(n,e){return q.onSnapshot(function(x){n(wrapQ(x));},e);},doc:function(id){return makeDoc(fs,path+'/'+(id||fs.collection(path).doc().id));},add:function(d){return fs.collection(path).add(d).then(function(r){return makeDoc(fs,path+'/'+r.id);});}};}
+function makeDb(fs){return{doc:function(p){return makeDoc(fs,p);},collection:function(p){return makeQuery(fs,fs.collection(p),p);}};}
+
+/* members and live timers are read per group, so a big site never downloads everyone */
+S.gw={};
+function mergeWatch(){
+  var p={},l={};
+  Object.keys(S.gw).forEach(function(g){var w=S.gw[g];for(var u in w.profs)p[u]=w.profs[u];for(var v in w.live)if(v!==S.uid)l[v]=w.live[v];});
+  S.profiles=p;S.live=l;
+}
+function watchGroups(){
+  var want=(S.mine.groups||[]);
+  Object.keys(S.gw).forEach(function(g){if(want.indexOf(g)<0){S.gw[g].unsubs.forEach(function(f){f();});delete S.gw[g];}});
+  want.forEach(function(g){
+    if(S.gw[g])return;
+    var w=S.gw[g]={unsubs:[],profs:{},live:{}};
+    w.unsubs.push(S.db.collection('profiles').where('groups','array-contains',g).onSnapshot(function(snap){if(S.gw[g]!==w)return;w.profs={};snap.docs.forEach(function(d){w.profs[d.id]=d.data();});mergeWatch();onRemote('profiles');},errNote));
+    w.unsubs.push(S.db.collection('live').where('groups','array-contains',g).onSnapshot(function(snap){if(S.gw[g]!==w)return;w.live={};snap.docs.forEach(function(d){w.live[d.id]=d.data();});mergeWatch();onRemote('live');},errNote));
+    S.db.doc('groups/'+g).get().then(function(x){if(x.exists){S.groups[g]=x.data();onRemote('groups');}}).catch(function(){});
+  });
+  mergeWatch();
+}
+function afterGroups(){watchGroups();saveLive();}
+
+/* ---------- sign in ---------- */
+function setupScreen(){gate('<h1>GROUP STUDY ARENA</h1><div class="card"><h3>One setup step left</h3><p class="muted">Open <b>firebase-config.js</b> and paste your Firebase web app settings into it. The README explains where to find them.</p></div>');}
+function loginScreen(){
+  var up=S.authMode==='up';
+  gate('<h1>GROUP STUDY ARENA</h1><p class="muted" style="margin-top:0">Study with friends, watch live timers, chat, and keep every session archived.</p><div class="card"><div class="seg" style="margin-bottom:16px"><button data-act="authtab" data-m="in" class="'+(up?'':'on')+'">Sign in</button><button data-act="authtab" data-m="up" class="'+(up?'on':'')+'">Create account</button></div><div class="field"><label for="aEmail">Email</label><input id="aEmail" type="email" autocomplete="email" inputmode="email"></div><div class="field"><label for="aPass">Password</label><input id="aPass" type="password" autocomplete="'+(up?'new-password':'current-password')+'" placeholder="At least 6 characters"></div><div id="aErr" class="muted" style="min-height:20px;margin-bottom:10px" role="alert"></div><button class="btn" style="width:100%" data-act="authgo">'+(up?'Create account':'Sign in')+'</button><div class="row" style="margin:14px 0 4px"><button class="btn ghost" style="width:100%" data-act="google">Continue with Google</button></div>'+(up?'':'<button class="back" style="margin:10px 0 0" data-act="forgot">Forgot password?</button>')+'</div>');
+}
+function authErr(e){
+  var c=(e&&e.code)||'';
+  var m={'auth/invalid-email':'That email address looks wrong.','auth/invalid-credential':'Wrong email or password.','auth/wrong-password':'Wrong email or password.','auth/user-not-found':'No account with that email. Create one first.','auth/email-already-in-use':'An account with this email already exists. Sign in instead.','auth/weak-password':'Use a password with at least 6 characters.','auth/popup-closed-by-user':'The sign-in window was closed.','auth/too-many-requests':'Too many attempts. Wait a minute and try again.','auth/network-request-failed':'No connection. Check your internet.','auth/unauthorized-domain':'This website address is not authorised in Firebase yet. See the README, step 2.','auth/operation-not-allowed':'This sign-in method is not turned on in Firebase yet. See the README, step 2.'};
+  return m[c]||('Could not sign in ('+(c||'unknown error')+').');
+}
+function showAuthErr(t){var el=$('#aErr');if(el)el.textContent=t;}
+function doAuth(){
+  var em=($('#aEmail').value||'').trim(),pw=$('#aPass').value||'';
+  if(!em||!pw){showAuthErr('Enter your email and password.');return;}
+  showAuthErr('');
+  var p=S.authMode==='up'?AUTH.createUserWithEmailAndPassword(em,pw):AUTH.signInWithEmailAndPassword(em,pw);
+  p.catch(function(e){showAuthErr(authErr(e));});
+}
+function doGoogle(){
+  var pr=new firebase.auth.GoogleAuthProvider();
+  AUTH.signInWithPopup(pr).catch(function(e){if(e&&e.code==='auth/popup-blocked'){AUTH.signInWithRedirect(pr);return;}showAuthErr(authErr(e));});
+}
+function doForgot(){
+  var em=($('#aEmail').value||'').trim();
+  if(!em){showAuthErr('Type your email above first.');return;}
+  AUTH.sendPasswordResetEmail(em).then(function(){showAuthErr('Reset email sent. Check your inbox.');}).catch(function(e){showAuthErr(authErr(e));});
+}
+async function startFor(){
   loading();
-  if(!window.claude||!window.claude.use){blocked('This page needs to run inside claude.ai to sign you in.');return;}
-  var timedOut=false,tm=setTimeout(function(){timedOut=true;blocked('Could not reach the sign-in service. Reload the page or open it from your claude.ai link.');},12000);
-  var db=await window.claude.use('db'),user=await window.claude.use('user');
-  clearTimeout(tm);
-  if(!db||!user){blocked();return;}
-  S.db=db;S.user=user;
-  S.uid=await user.id();
-  if(!S.uid){blocked('Your account was not recognised here. Open the page signed in to claude.ai.');return;}
   var snap;
-  try{snap=await db.doc('profiles/'+S.uid).get();}
-  catch(e){blocked('Could not load your profile. Reload and try again.');return;}
-  if(snap.exists){S.mine=clone(snap.data());S.mine.groups=S.mine.groups||[];S.mine.subjects=S.mine.subjects&&S.mine.subjects.length?S.mine.subjects:(EXAMS[S.mine.exam]||EXAMS.jee).sub.slice();await enterApp();}
-  else{onboarding(1);}
+  try{snap=await S.db.doc('profiles/'+S.uid).get();}
+  catch(e){gate('<h1>GROUP STUDY ARENA</h1><div class="card"><h3>Could not load your profile</h3><p class="muted">If you just set this site up, check that the Firestore rules from the README are published, then reload. ('+esc((e&&e.code)||'error')+')</p></div>');return;}
+  if(snap.exists){
+    S.mine=clone(snap.data());S.mine.groups=S.mine.groups||[];
+    S.mine.subjects=S.mine.subjects&&S.mine.subjects.length?S.mine.subjects:(EXAMS[S.mine.exam]||EXAMS.jee).sub.slice();
+    await enterApp();
+  }else{onboarding(1);}
+}
+function boot(){
+  loading();
+  S.authMode='in';
+  if(!window.firebase||!cfgOk()){setupScreen();return;}
+  firebase.initializeApp(window.FIREBASE_CONFIG);
+  AUTH=firebase.auth();
+  S.db=makeDb(firebase.firestore());
+  AUTH.onAuthStateChanged(function(u){
+    if(!u){if(S.started){location.reload();return;}loginScreen();return;}
+    if(S.started)return;
+    S.started=true;S.uid=u.uid;startFor();
+  });
 }
 boot();
 })();
 </script>
-
-</body></html>
+</body>
+</html>
