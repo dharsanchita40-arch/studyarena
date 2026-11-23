@@ -223,7 +223,7 @@ var EMO={
   Fun:'🦉 🐼 🦊 🐯 🦁 🐙 🦋 🐢 🐧 🐶 🐱 🦄 🍕 🍜 🍫 🍎 🍌 🥤 🍪 🍿'.split(' ')
 };
 var CODE_CHARS='abcdefghjkmnpqrstuvwxyz23456789';
-var STALE_MS=300000;
+var STALE_MS=900000; /* 15 min: how long a silent app still counts as studying. Change this number to adjust. */
 
 /* ---------- helpers ---------- */
 function $(s,r){return (r||document).querySelector(s);}
@@ -296,7 +296,7 @@ function liveOf(uid){
   if(L.status==='off'||!L.startedAt)return o;
   var me=uid===S.uid;
   var stale=!me&&now-(L.lastBeat||0)>STALE_MS;
-  var ref=me?now:Math.min(now,(L.lastBeat||0)+150000);
+  var ref=me?now:Math.min(now,(L.lastBeat||0)+STALE_MS);
   o.subject=L.subject||'';o.mode=L.mode;
   if(L.status==='focus'){
     var from=Math.max(L.startedAt,sod(now));
@@ -359,17 +359,31 @@ function recoverLive(){
   var L=S.mylive;if(!L||L.status==='off'||!L.startedAt)return;
   var now=Date.now();
   if(now-(L.lastBeat||0)<=STALE_MS)return;
-  var cap=Math.max(L.startedAt,(L.lastBeat||L.startedAt)+150000);
+  var cap=Math.max(L.startedAt,(L.lastBeat||L.startedAt)+STALE_MS);
   if(L.status==='focus'){
     var full=L.mode==='pomodoro'&&cap>=L.startedAt+L.phaseLen*1000;
     var end=L.mode==='pomodoro'?Math.min(cap,L.startedAt+L.phaseLen*1000):cap;
     bank(L.startedAt,end,L.subject,full);
-    toast('Your last session was saved up to '+clockTime(end));
+    toast('The app was inactive, so your session was saved up to '+clockTime(end));
   }
   L.status='off';L.startedAt=0;syncToday();saveLive();
+  if(S.ready)refreshLive();
+}
+var WL=null,WLP=false,TOUCH=Date.now(),WAKE_MAX_MS=10800000; /* screen stays on at most 3h without a touch */
+['pointerdown','keydown','touchstart'].forEach(function(ev){document.addEventListener(ev,function(){TOUCH=Date.now();},{passive:true,capture:true});});
+function wakeSync(){
+  try{
+    if(!('wakeLock' in navigator))return;
+    var L=S.mylive,on=!!(L&&L.status&&L.status!=='off'&&L.startedAt)&&(Date.now()-TOUCH<WAKE_MAX_MS);
+    if(on&&!document.hidden&&!WL&&!WLP){
+      WLP=true;
+      navigator.wakeLock.request('screen').then(function(l){WLP=false;WL=l;l.addEventListener('release',function(){WL=null;});}).catch(function(){WLP=false;});
+    }else if(!on&&WL){var w=WL;WL=null;w.release().catch(function(){});}
+  }catch(e){}
 }
 function heartbeat(){
   var L=S.mylive;if(!L||L.status==='off')return;
+  if(Date.now()-(L.lastBeat||0)>STALE_MS){recoverLive();return;}
   L.lastBeat=Date.now();saveLive();
 }
 
@@ -973,13 +987,15 @@ async function enterApp(){
       if(!S.ready)return;
       S.t++;
       if(S.mylive&&S.mylive.date!==dkey(Date.now())){syncToday();saveLive();}
+      recoverLive();
       advance();
+      if(S.t%5===0)wakeSync();
       if(S.view==='home'){tickFocus();tickSquad();if(S.t%20===0)renderSquad();}
       else if(S.view==='friend'&&S.t%10===0)paintFriendSub();
       if((S.view==='stats'||S.view==='friend')&&S.t%15===0&&S.mylive&&S.mylive.status==='focus')renderStatsBody();
     },1000);
     setInterval(heartbeat,120000);
-    document.addEventListener('visibilitychange',function(){if(!document.hidden&&S.ready){advance();heartbeat();}});
+    document.addEventListener('visibilitychange',function(){if(!S.ready)return;if(document.hidden){heartbeat();}else{recoverLive();advance();heartbeat();wakeSync();}});
   }
 }
 /* ---------- firebase ---------- */
