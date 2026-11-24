@@ -274,7 +274,26 @@ function writeFail(e){
 }
 function saveProfile(){return enqueue(function(){return S.db.doc('profiles/'+S.uid).set(clone(S.mine));});}
 function saveLive(){return enqueue(function(){S.mylive.groups=((S.mine&&S.mine.groups)||[]).slice();return S.db.doc('live/'+S.uid).set(clone(S.mylive));});}
-function saveDay(key){var d=clone(S.logs[key]);return enqueue(function(){return S.db.doc('logs/'+S.uid+'/days/'+key).set(d);});}
+function saveDay(key,delta){
+  var local=clone(S.logs[key]);
+  return enqueue(function(){
+    var ref=S.db.doc('logs/'+S.uid+'/days/'+key);
+    if(!delta)return ref.set(local);
+    /* Add only what THIS device just studied to whatever the server already holds, so another device can never be overwritten. */
+    return ref.get().then(function(snap){
+      var m=(snap&&snap.exists)?clone(snap.data()):{date:key,sec:0,subj:{},pomos:0};
+      m.date=key;m.subj=m.subj||{};
+      m.sec=(m.sec||0)+delta.sec;
+      Object.keys(delta.subj).forEach(function(n){m.subj[n]=(m.subj[n]||0)+delta.subj[n];});
+      m.pomos=(m.pomos||0)+(delta.pomos||0);
+      var changed=m.sec!==local.sec;
+      S.logs[key]=clone(m);
+      return ref.set(m).then(function(){
+        if(changed&&key===dkey(Date.now())){syncToday();saveLive();if(S.ready)refreshLive();}
+      });
+    },function(){return ref.set(local);});
+  });
+}
 
 /* ---------- live timer logic ---------- */
 function todayLog(){return S.logs[dkey(Date.now())]||{sec:0,pomos:0};}
@@ -317,14 +336,16 @@ function liveOf(uid){
 }
 function bank(a,b,subj,pomo){
   if(b-a<1000&&!pomo)return;
-  var cur=a,touched={};
+  var cur=a,deltas={};
+  function dl(k){return deltas[k]||(deltas[k]={sec:0,subj:{},pomos:0});}
   while(cur<b){
     var seg=Math.min(b,nextMid(cur)),secs=Math.round((seg-cur)/1000),k=dkey(cur);
     var e=S.logs[k]||(S.logs[k]={date:k,sec:0,subj:{},pomos:0});
-    e.sec+=secs;e.subj=e.subj||{};e.subj[subj]=(e.subj[subj]||0)+secs;touched[k]=1;cur=seg;
+    e.sec+=secs;e.subj=e.subj||{};e.subj[subj]=(e.subj[subj]||0)+secs;
+    var d1=dl(k);d1.sec+=secs;d1.subj[subj]=(d1.subj[subj]||0)+secs;cur=seg;
   }
-  if(pomo){var k2=dkey(Math.max(a,b-1));var e2=S.logs[k2]||(S.logs[k2]={date:k2,sec:0,subj:{},pomos:0});e2.pomos=(e2.pomos||0)+1;touched[k2]=1;}
-  Object.keys(touched).forEach(saveDay);
+  if(pomo){var k2=dkey(Math.max(a,b-1));var e2=S.logs[k2]||(S.logs[k2]={date:k2,sec:0,subj:{},pomos:0});e2.pomos=(e2.pomos||0)+1;dl(k2).pomos+=1;}
+  Object.keys(deltas).forEach(function(k){saveDay(k,deltas[k]);});
 }
 function startFocus(){
   var L=ensureLive(),s=S.sel,now=Date.now();
@@ -368,6 +389,21 @@ function recoverLive(){
   }
   L.status='off';L.startedAt=0;syncToday();saveLive();
   if(S.ready)refreshLive();
+}
+function refreshMine(){
+  if(!S.ready||!S.db)return;
+  enqueue(function(){
+    return S.db.collection('logs/'+S.uid+'/days').orderBy('date','desc').limit(400).get().then(function(lg){
+      var nl={};lg.docs.forEach(function(d){nl[d.id]=clone(d.data());});
+      S.logs=nl;
+      return S.db.doc('live/'+S.uid).get();
+    }).then(function(ls){
+      var L=S.mylive;
+      if((!L||L.status==='off')&&ls&&ls.exists){S.mylive=clone(ls.data());ensureLive();recoverLive();}
+      syncToday();
+      if(S.ready)refreshLive();
+    }).catch(function(){});
+  });
 }
 var WL=null,WLP=false,TOUCH=Date.now(),WAKE_MAX_MS=10800000; /* screen stays on at most 3h without a touch */
 ['pointerdown','keydown','touchstart'].forEach(function(ev){document.addEventListener(ev,function(){TOUCH=Date.now();},{passive:true,capture:true});});
@@ -995,7 +1031,7 @@ async function enterApp(){
       if((S.view==='stats'||S.view==='friend')&&S.t%15===0&&S.mylive&&S.mylive.status==='focus')renderStatsBody();
     },1000);
     setInterval(heartbeat,120000);
-    document.addEventListener('visibilitychange',function(){if(!S.ready)return;if(document.hidden){heartbeat();}else{recoverLive();advance();heartbeat();wakeSync();}});
+    document.addEventListener('visibilitychange',function(){if(!S.ready)return;if(document.hidden){S.hiddenAt=Date.now();heartbeat();}else{recoverLive();advance();heartbeat();wakeSync();if(Date.now()-(S.hiddenAt||0)>30000)refreshMine();}});
   }
 }
 /* ---------- firebase ---------- */
