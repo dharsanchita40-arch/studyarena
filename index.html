@@ -232,6 +232,7 @@ function esc(t){return String(t==null?'':t).replace(/[&<>"']/g,function(c){retur
 function pad(n){return n<10?'0'+n:''+n;}
 function dkey(d){d=d instanceof Date?d:new Date(d);return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate());}
 function sod(ms){var d=new Date(ms);return new Date(d.getFullYear(),d.getMonth(),d.getDate()).getTime();}
+function dayShift(ms,n){var d=new Date(ms);return new Date(d.getFullYear(),d.getMonth(),d.getDate()+n,12).getTime();}
 function nextMid(ms){var d=new Date(ms);return new Date(d.getFullYear(),d.getMonth(),d.getDate()+1).getTime();}
 function hms(s){s=Math.max(0,Math.floor(s));return pad(Math.floor(s/3600))+':'+pad(Math.floor(s%3600/60))+':'+pad(s%60);}
 function mss(s){s=Math.max(0,Math.ceil(s));return pad(Math.floor(s/60))+':'+pad(s%60);}
@@ -243,14 +244,15 @@ function rankOf(sec){var h=sec/3600;if(sec<=0)return'Idle';if(h>=8)return'God Mo
 function toast(t){var e=$('#toast');e.textContent=t;e.classList.add('show');clearTimeout(toast._t);toast._t=setTimeout(function(){e.classList.remove('show');},2600);}
 function lsGet(k){try{return localStorage.getItem(k);}catch(e){return null;}}
 function lsSet(k,v){try{localStorage.setItem(k,v);}catch(e){}}
-function chime(){try{var C=window.AudioContext||window.webkitAudioContext;if(!C)return;var c=new C();var o=c.createOscillator(),g=c.createGain();o.connect(g);g.connect(c.destination);o.frequency.value=660;g.gain.setValueAtTime(.12,c.currentTime);g.gain.exponentialRampToValueAtTime(.001,c.currentTime+.7);o.start();o.stop(c.currentTime+.7);}catch(e){}}
+function chime(){try{var C=window.AudioContext||window.webkitAudioContext;if(!C)return;var c=new C();var o=c.createOscillator(),g=c.createGain();o.connect(g);g.connect(c.destination);o.frequency.value=660;g.gain.setValueAtTime(.12,c.currentTime);g.gain.exponentialRampToValueAtTime(.001,c.currentTime+.7);o.start();o.stop(c.currentTime+.7);setTimeout(function(){try{c.close();}catch(e){}},1200);}catch(e){}}
 
 /* ---------- state ---------- */
 var S={db:null,user:null,uid:null,mine:null,profiles:{},live:{},groups:{},logs:{},fLogs:{},mylive:null,
   view:'home',params:{},activeGroup:null,ready:false,readOnly:false,q:Promise.resolve(),t:0,
   sel:{subject:'',mode:'stopwatch',focusMin:25,breakMin:5},range:'7d',calYear:new Date().getFullYear(),
   modal:null,msgs:[],msgUnsub:null,msgGid:null,emoOpen:false,emoCat:'Faces',ob:null,pendingJoin:null,booted:false};
-if(S.calYear<2026)S.calYear=2026;if(S.calYear>2029)S.calYear=2029;
+var YEAR_MAX=Math.max(2029,new Date().getFullYear()+1);
+if(S.calYear<2026)S.calYear=2026;if(S.calYear>YEAR_MAX)S.calYear=YEAR_MAX;
 
 /* ---------- profile helpers ---------- */
 function prof(uid){return uid===S.uid?S.mine:S.profiles[uid];}
@@ -349,12 +351,13 @@ function bank(a,b,subj,pomo){
 }
 function startFocus(){
   var L=ensureLive(),s=S.sel,now=Date.now();
+  if(L.status!=='off')return;
   if(!s.subject){toast('Pick a subject first');return;}
   L.status='focus';L.mode=s.mode;L.subject=s.subject;L.startedAt=now;L.lastBeat=now;
   L.phaseLen=s.mode==='pomodoro'?s.focusMin*60:0;L.pb=s.breakMin*60;
   syncToday();saveLive();refreshLive();
 }
-function stopFocus(){
+function doStop(){
   var L=S.mylive;if(!L||L.status==='off')return;
   var now=Date.now();
   if(L.status==='focus'){
@@ -362,6 +365,28 @@ function stopFocus(){
     bank(L.startedAt,end,L.subject,false);
   }
   L.status='off';L.startedAt=0;L.lastBeat=now;syncToday();saveLive();refreshLive();
+}
+function stopFocus(){
+  var L=S.mylive;if(!L||L.status==='off')return;
+  if(Date.now()-(L.lastBeat||0)>STALE_MS){recoverLive();return;}
+  if(S._stopping)return;
+  var st=L.status,sa=L.startedAt;
+  S._stopping=true;
+  /* Check the server first: if another device already ended this session, do not count it twice. */
+  enqueue(function(){
+    return S.db.doc('live/'+S.uid).get().then(function(snap){
+      S._stopping=false;
+      var cur=S.mylive;
+      if(!cur||cur.status!==st||cur.startedAt!==sa)return;
+      var r=snap&&snap.exists?snap.data():null;
+      if(r&&(r.status!==st||r.startedAt!==sa)){
+        S.mylive=clone(r);ensureLive();syncToday();refreshLive();
+        toast('That session was already ended on another device.');
+        return;
+      }
+      doStop();
+    },function(){S._stopping=false;doStop();});
+  });
 }
 function advance(depth){
   var L=S.mylive;if(!L||L.status==='off'||L.mode!=='pomodoro'||!L.startedAt)return;
@@ -420,7 +445,22 @@ function wakeSync(){
 function heartbeat(){
   var L=S.mylive;if(!L||L.status==='off')return;
   if(Date.now()-(L.lastBeat||0)>STALE_MS){recoverLive();return;}
-  L.lastBeat=Date.now();saveLive();
+  L.lastBeat=Date.now();
+  var st=L.status,sa=L.startedAt;
+  enqueue(function(){
+    var cur=S.mylive;
+    if(!cur||cur.status!==st||cur.startedAt!==sa)return; /* changed on this device meanwhile: its own save is queued */
+    return S.db.doc('live/'+S.uid).get().then(function(snap){
+      cur=S.mylive;
+      if(!cur||cur.status!==st||cur.startedAt!==sa)return;
+      var r=snap&&snap.exists?snap.data():null;
+      if(r&&(r.status!==st||r.startedAt!==sa)){ /* another device ended or replaced this session: follow it, never revive it */
+        S.mylive=clone(r);ensureLive();syncToday();if(S.ready)refreshLive();return;
+      }
+      cur.lastBeat=Date.now();cur.groups=((S.mine&&S.mine.groups)||[]).slice();
+      return S.db.doc('live/'+S.uid).set(clone(cur));
+    });
+  });
 }
 
 /* ---------- groups ---------- */
@@ -489,8 +529,8 @@ function logsFor(uid){
 function rangeKeys(r){
   var now=Date.now(),to=dkey(now);
   if(r==='today')return[to,to];
-  if(r==='7d')return[dkey(now-6*864e5),to];
-  if(r==='30d')return[dkey(now-29*864e5),to];
+  if(r==='7d')return[dkey(dayShift(now,-6)),to];
+  if(r==='30d')return[dkey(dayShift(now,-29)),to];
   return['0000','9999'];
 }
 function aggregate(logs,a,b){
@@ -505,8 +545,8 @@ function aggregate(logs,a,b){
 function streakOf(logs){
   var n=0,t=Date.now();
   var today=logs[dkey(t)];
-  if(!today||!(today.sec>=60))t-=864e5;
-  while(true){var d=logs[dkey(t)];if(d&&d.sec>=60){n++;t-=864e5;}else break;}
+  if(!today||!(today.sec>=60))t=dayShift(t,-1);
+  while(n<4000){var d=logs[dkey(t)];if(d&&d.sec>=60){n++;t=dayShift(t,-1);}else break;}
   return n;
 }
 function subjColor(n){return SUBCOL[n]||'var(--fog)';}
@@ -516,9 +556,10 @@ function donutSVG(by,total){
   var R=62,C=2*Math.PI*R,cx=100,cy=100,sw=30;
   var ents=Object.keys(by).filter(function(k){return by[k]>0;}).sort(function(a,b){return by[b]-by[a];});
   var s='<svg viewBox="0 0 200 200" role="img" aria-label="Time by subject"><circle cx="'+cx+'" cy="'+cy+'" r="'+R+'" fill="none" stroke="#253745" stroke-width="'+sw+'" opacity="'+(ents.length?0.25:1)+'"/>';
-  var acc=0,labels='';
+  var acc=0,labels='',sumBy=0;
+  ents.forEach(function(k){sumBy+=by[k];});
   ents.forEach(function(k){
-    var frac=by[k]/total,len=frac*C,gap=ents.length>1?Math.min(3,len*0.4):0;
+    var frac=by[k]/(sumBy||1),len=frac*C,gap=ents.length>1?Math.min(3,len*0.4):0;
     s+='<circle cx="'+cx+'" cy="'+cy+'" r="'+R+'" fill="none" stroke="'+subjHex(k)+'" stroke-width="'+sw+'" stroke-dasharray="'+(len-gap).toFixed(2)+' '+(C-len+gap).toFixed(2)+'" stroke-dashoffset="'+(-acc).toFixed(2)+'" transform="rotate(-90 '+cx+' '+cy+')"/>';
     var mid=(acc+len/2)/C*2*Math.PI-Math.PI/2;
     if(frac>=0.07)labels+='<text x="'+(cx+R*Math.cos(mid)).toFixed(1)+'" y="'+(cy+R*Math.sin(mid)+4).toFixed(1)+'" text-anchor="middle" font-size="11" font-weight="700" fill="#06141B">'+Math.round(frac*100)+'%</text>';
@@ -529,7 +570,7 @@ function donutSVG(by,total){
 }
 function barsSVG(logs,goalH){
   var days=[],now=Date.now(),max=Math.max(1,goalH||0);
-  for(var i=13;i>=0;i--){var t=now-i*864e5,k=dkey(t),h=((logs[k]&&logs[k].sec)||0)/3600;days.push({k:k,h:h,d:new Date(t)});if(h>max)max=h;}
+  for(var i=13;i>=0;i--){var t=dayShift(now,-i),k=dkey(t),h=((logs[k]&&logs[k].sec)||0)/3600;days.push({k:k,h:h,d:new Date(t)});if(h>max)max=h;}
   max=Math.ceil(max);
   var W=560,H=190,L=34,B=28,T=10,bw=(W-L-6)/14,ph=H-B-T;
   var s='<svg class="chart-svg" viewBox="0 0 '+W+' '+H+'" role="img" aria-label="Hours studied, last 14 days">';
@@ -547,7 +588,7 @@ function statsShell(){
   return'<div class="card"><div class="row" style="justify-content:space-between"><h3>Time by subject</h3><div class="seg" id="rangeSeg">'+
     RANGES.map(function(r){return'<button data-act="range" data-r="'+r[0]+'" class="'+(S.range===r[0]?'on':'')+'">'+r[1]+'</button>';}).join('')+
     '</div></div><div id="sumRow"></div><div class="stat-grid"><div id="donutBox"></div><div id="barsBox"></div></div></div>'+
-    '<div class="card" style="margin-top:14px"><div class="row" style="justify-content:space-between;margin-bottom:12px"><h3>Archive</h3><div class="row"><div class="keyrow"><span><i style="background:#11212D;border:1px solid #253745"></i>0</span><span><i style="background:#253745"></i>&lt;1h</span><span><i style="background:#4A5C6A"></i>1-3h</span><span><i style="background:#9BA8AB"></i>3-6h</span><span><i style="background:#CCD0CF"></i>6h+</span></div><select id="yearSel" aria-label="Year">'+[2026,2027,2028,2029].map(function(y){return'<option'+(y===S.calYear?' selected':'')+'>'+y+'</option>';}).join('')+'</select></div></div><div id="calBox"></div></div>';
+    '<div class="card" style="margin-top:14px"><div class="row" style="justify-content:space-between;margin-bottom:12px"><h3>Archive</h3><div class="row"><div class="keyrow"><span><i style="background:#11212D;border:1px solid #253745"></i>0</span><span><i style="background:#253745"></i>&lt;1h</span><span><i style="background:#4A5C6A"></i>1-3h</span><span><i style="background:#9BA8AB"></i>3-6h</span><span><i style="background:#CCD0CF"></i>6h+</span></div><select id="yearSel" aria-label="Year">'+(function(){var a=[];for(var y=2026;y<=YEAR_MAX;y++)a.push(y);return a;})().map(function(y){return'<option'+(y===S.calYear?' selected':'')+'>'+y+'</option>';}).join('')+'</select></div></div><div id="calBox"></div></div>';
 }
 function renderStatsBody(){
   var uid=S.params.uid||S.uid;
@@ -556,7 +597,8 @@ function renderStatsBody(){
   var goal=p.goal||6;
   $('#sumRow').innerHTML='<div class="tiles-sum"><div class="sum"><div class="k">Studied</div><div class="v">'+hm(ag.total)+'</div></div><div class="sum"><div class="k">Streak</div><div class="v">'+streakOf(logs)+' day'+(streakOf(logs)===1?'':'s')+'</div></div><div class="sum"><div class="k">Pomodoros</div><div class="v">'+ag.pomos+'</div></div><div class="sum"><div class="k">Best day</div><div class="v">'+hm(all.best)+'</div></div><div class="sum"><div class="k">Avg per active day</div><div class="v">'+hm(ag.days?ag.total/ag.days:0)+'</div></div></div>';
   var ents=Object.keys(ag.by).filter(function(k){return ag.by[k]>0;}).sort(function(a,b){return ag.by[b]-ag.by[a];});
-  var leg=ents.length?ents.map(function(k){return'<div><i style="background:'+subjColor(k)+'"></i><b>'+esc(k)+'</b><span>'+hmc(ag.by[k])+' · '+Math.round(ag.by[k]/ag.total*100)+'%</span></div>';}).join(''):'<div class="muted">No study logged in this range yet.</div>';
+  var sumBy=0;ents.forEach(function(k){sumBy+=ag.by[k];});
+  var leg=ents.length?ents.map(function(k){return'<div><i style="background:'+subjColor(k)+'"></i><b>'+esc(k)+'</b><span>'+hmc(ag.by[k])+' · '+Math.round(ag.by[k]/(sumBy||1)*100)+'%</span></div>';}).join(''):'<div class="muted">No study logged in this range yet.</div>';
   $('#donutBox').innerHTML='<div class="donut-wrap">'+donutSVG(ag.by,ag.total)+'<div class="legend">'+leg+'</div></div>';
   $('#barsBox').innerHTML='<div class="lbl" style="margin-bottom:6px">Last 14 days · dashed line is the daily goal</div>'+barsSVG(logs,goal);
   var y=S.calYear,today=dkey(Date.now()),months='';
@@ -714,9 +756,10 @@ function mountFriend(m){
   m.innerHTML=bannerHTML()+'<button class="back" data-act="back">&larr; Back</button><section class="card"><div class="pf-head">'+avatar(p,84)+'<div class="grow"><h1 style="font-size:26px">'+esc(p.name||'Someone')+'</h1><div class="muted" id="fSub"></div><div class="chips" style="margin-top:8px">'+(ex?'<span class="chip on">'+esc(ex.label)+'</span>':'')+((p.subjects||[]).map(function(n){return'<span class="chip"><i style="background:'+subjColor(n)+'"></i>'+esc(n)+'</span>';}).join(''))+'</div></div></div>'+(p.bio?'<p style="margin:14px 0 0;overflow-wrap:anywhere">'+esc(p.bio)+'</p>':'')+'</section><div style="height:14px"></div>'+statsShell();
   paintFriendSub();
   renderStatsBody();
-  if(uid!==S.uid&&!S.fLogs[uid]){
+  S.fLogsAt=S.fLogsAt||{};
+  if(uid!==S.uid&&(!S.fLogs[uid]||Date.now()-(S.fLogsAt[uid]||0)>60000)){
     S.db.collection('logs/'+uid+'/days').orderBy('date','desc').limit(400).get().then(function(snap){
-      var o={};snap.docs.forEach(function(d){o[d.id]=d.data();});S.fLogs[uid]=o;
+      var o={};snap.docs.forEach(function(d){o[d.id]=d.data();});S.fLogs[uid]=o;S.fLogsAt[uid]=Date.now();
       if(S.view==='friend'&&S.params.uid===uid){paintFriendSub();renderStatsBody();}
     }).catch(function(){toast('Could not load their stats');});
   }
@@ -785,8 +828,8 @@ function sendMsg(){
   var gid=S.activeGroup;
   enqueue(function(){
     return S.db.collection('chats/'+gid+'/msgs').add({uid:S.uid,text:t.slice(0,500),ts:Date.now()}).then(function(){
-      if(Math.random()<0.2)return S.db.collection('chats/'+gid+'/msgs').where('ts','<',Date.now()-7*864e5).limit(20).get().then(function(snap){return Promise.all(snap.docs.map(function(d){return S.db.doc('chats/'+gid+'/msgs/'+d.id).delete();}));});
-    });
+      if(Math.random()<0.2)return S.db.collection('chats/'+gid+'/msgs').where('ts','<',Date.now()-7*864e5).limit(20).get().then(function(snap){return Promise.all(snap.docs.map(function(d){return S.db.doc('chats/'+gid+'/msgs/'+d.id).delete();}));}).catch(function(){});
+    },function(e){var i2=$('#chatIn');if(i2&&!i2.value)i2.value=t;throw e;});
   });
 }
 function renderEmo(){
@@ -803,7 +846,8 @@ function closeModal(){
   S.modal=null;$('#modalRoot').innerHTML='';
 }
 function renderModal(){
-  var m=S.modal,root=$('#modalRoot');if(!m){root.innerHTML='';return;}
+  var m=S.modal,root=$('#modalRoot');
+  if(m&&m.gid)m.gid=String(m.gid).toLowerCase().replace(/[^a-z0-9]/g,'');if(!m){root.innerHTML='';return;}
   var h='';
   if(m.type==='groupmenu'){
     h='<h3>Groups</h3><p class="muted" style="margin:0 0 14px">Make your own group or join a friend\'s.</p><div class="row"><button class="btn grow" data-act="newgroup">Create a group</button><button class="btn ghost grow" data-act="joinmodal">Join with a code</button></div>';
@@ -828,7 +872,7 @@ function renderModal(){
     var p=m.key.split('-'),title=new Date(+p[0],+p[1]-1,+p[2]).toLocaleDateString('en-GB',{weekday:'long',day:'numeric',month:'long',year:'numeric'});
     h='<h3>'+esc(title)+'</h3>';
     if(!(d.sec>0))h='<h3>'+esc(title)+'</h3><p class="muted" style="margin-top:12px">No study logged on this day.</p>';
-    else h+='<div class="tiles-sum"><div class="sum"><div class="k">Studied</div><div class="v">'+hm(d.sec)+'</div></div><div class="sum"><div class="k">Pomodoros</div><div class="v">'+(d.pomos||0)+'</div></div><div class="sum"><div class="k">Rank</div><div class="v" style="font-size:16px">'+rankOf(d.sec)+'</div></div></div>'+ents.map(function(k){return'<div class="daybar"><span style="width:92px;font-size:13px">'+esc(k)+'</span><div class="bar"><i style="width:'+Math.round(d.subj[k]/d.sec*100)+'%;background:'+subjColor(k)+'"></i></div><span class="mono" style="font-size:12px">'+hmc(d.subj[k])+'</span></div>';}).join('');
+    else h+='<div class="tiles-sum"><div class="sum"><div class="k">Studied</div><div class="v">'+hm(d.sec)+'</div></div><div class="sum"><div class="k">Pomodoros</div><div class="v">'+(d.pomos||0)+'</div></div><div class="sum"><div class="k">Rank</div><div class="v" style="font-size:16px">'+rankOf(d.sec)+'</div></div></div>'+ents.map(function(k){return'<div class="daybar"><span style="width:92px;font-size:13px">'+esc(k)+'</span><div class="bar"><i style="width:'+Math.min(100,Math.round(d.subj[k]/d.sec*100))+'%;background:'+subjColor(k)+'"></i></div><span class="mono" style="font-size:12px">'+hmc(d.subj[k])+'</span></div>';}).join('');
   }
   root.innerHTML='<div class="ov" data-act="ovclose"><div class="modal" role="dialog" aria-modal="true"><button class="x" data-act="closemodal" aria-label="Close">&times;</button>'+h+'</div></div>';
   var f=$('#gName')||$('#gCode');if(f)f.focus();
@@ -921,12 +965,19 @@ function act(a,t){
   else if(a==='obback'){grabOb();onboarding(1);}
   else if(a==='obsave'){grabOb();finishOnboarding();}
   else if(a==='saveprofile'){grabOb();saveOwnProfile();}
-  else if(a==='signout'){AUTH.signOut().then(function(){location.reload();});}
+  else if(a==='signout'){doSignOut();}
   else if(a==='authtab'){S.authMode=t.getAttribute('data-m');var e1=$('#aEmail')?$('#aEmail').value:'';loginScreen();$('#aEmail').value=e1;}
   else if(a==='authgo'){doAuth();}
   else if(a==='google'){doGoogle();}
   else if(a==='forgot'){doForgot();}
   else if(a==='copylink'){copyText(t.getAttribute('data-l'));}
+}
+function flush(){var p=S.q;return p.then(function(){return S.q===p?null:flush();});}
+function doSignOut(){
+  var go=function(){AUTH.signOut().then(function(){location.reload();});};
+  var L=S.mylive;
+  if(L&&L.status!=='off')stopFocus();
+  flush().then(go,go);
 }
 function grabOb(){
   var n=$('#fName'),a=$('#fAge'),g=$('#fGoal'),b=$('#fBio');
@@ -985,6 +1036,7 @@ function saveOwnProfile(){
 /* ---------- join flow ---------- */
 function openJoin(gid){
   gid=String(gid).toLowerCase();
+  if(!/^[a-z0-9]{4,12}$/.test(gid)){toast('That code does not look right');return;}
   if((S.mine.groups||[]).indexOf(gid)>=0){S.activeGroup=gid;lsSet('gsa_group',gid);closeModal();clearHash();go('home');toast('You are already in this group');return;}
   openModal({type:'join',gid:gid});
   if(!S.groups[gid]){S.db.doc('groups/'+gid).get().then(function(s){if(s.exists){S.groups[gid]=s.data();if(S.modal&&S.modal.type==='join'&&S.modal.gid===gid)renderModal();}else if(S.modal&&S.modal.type==='join'&&S.modal.gid===gid){$('#modalRoot .modal').insertAdjacentHTML('beforeend','<p class="muted">No group found with code '+esc(gid.toUpperCase())+'.</p>');}}).catch(function(){});}
@@ -1031,7 +1083,7 @@ async function enterApp(){
       if((S.view==='stats'||S.view==='friend')&&S.t%15===0&&S.mylive&&S.mylive.status==='focus')renderStatsBody();
     },1000);
     setInterval(heartbeat,120000);
-    document.addEventListener('visibilitychange',function(){if(!S.ready)return;if(document.hidden){S.hiddenAt=Date.now();heartbeat();}else{recoverLive();advance();heartbeat();wakeSync();if(Date.now()-(S.hiddenAt||0)>30000)refreshMine();}});
+    document.addEventListener('visibilitychange',function(){if(!S.ready)return;if(document.hidden){S.hiddenAt=Date.now();}else{recoverLive();advance();heartbeat();wakeSync();if(Date.now()-(S.hiddenAt||0)>30000)refreshMine();}});
   }
 }
 /* ---------- firebase ---------- */
@@ -1085,7 +1137,7 @@ function doAuth(){
 }
 function doGoogle(){
   var pr=new firebase.auth.GoogleAuthProvider();
-  AUTH.signInWithPopup(pr).catch(function(e){if(e&&e.code==='auth/popup-blocked'){AUTH.signInWithRedirect(pr);return;}showAuthErr(authErr(e));});
+  AUTH.signInWithPopup(pr).catch(function(e){if(e&&(e.code==='auth/popup-blocked'||e.code==='auth/operation-not-supported-in-this-environment')){AUTH.signInWithRedirect(pr);return;}showAuthErr(authErr(e));});
 }
 function doForgot(){
   var em=($('#aEmail').value||'').trim();
